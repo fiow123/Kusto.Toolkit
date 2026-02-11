@@ -321,6 +321,212 @@ namespace Tests
         }
 
         [TestMethod]
+        public void TestGetSourceColumnsWithFunctions()
+        {
+            var globals = GlobalState.Default
+                .WithCluster(
+                    new ClusterSymbol("cluster",
+                        new DatabaseSymbol("db1",
+                            new TableSymbol("TabXY", "(x: long, y: string)"),
+                            new TableSymbol("TabXZ", "(x: long, z: real)"),
+                            new FunctionSymbol("FnQ", "()", "{ TabXY | project Q=x }"),
+                            new FunctionSymbol("FnPQ", "()", "{ FnQ | project P=Q }"),
+                            new FunctionSymbol("FnWithArg", "(a: long)", "{ TabXY | where x == a }"))))
+                .WithDatabase("db1");
+
+            // Direct table access: no function in chain
+            TestGetSourceColumnsWithFunctions("TabXY", "x", "TabXY.x", "", globals);
+            TestGetSourceColumnsWithFunctions("TabXY", "y", "TabXY.y", "", globals);
+            TestGetSourceColumnsWithFunctions("TabXY | project Q=x", "Q", "TabXY.x", "", globals);
+
+            // Function with parens: single function in chain
+            TestGetSourceColumnsWithFunctions("FnQ()", "Q", "TabXY.x", "FnQ", globals);
+
+            // Bare-name function (zero-arg, no parens): single function in chain
+            TestGetSourceColumnsWithFunctions("FnQ", "Q", "TabXY.x", "FnQ", globals);
+
+            // Nested functions: chain is outermost to innermost
+            TestGetSourceColumnsWithFunctions("FnPQ()", "P", "TabXY.x", "FnPQ>FnQ", globals);
+            TestGetSourceColumnsWithFunctions("FnPQ", "P", "TabXY.x", "FnPQ>FnQ", globals);
+
+            // Function with arguments (pass-through: where reuses same ColumnSymbol instances,
+            // but the table reference map recovers the function attribution from syntax tree)
+            TestGetSourceColumnsWithFunctions("FnWithArg(10)", "x", "TabXY.x", "FnWithArg", globals);
+            TestGetSourceColumnsWithFunctions("FnWithArg(10)", "y", "TabXY.y", "FnWithArg", globals);
+
+            // Mixed: function output joined/unioned with direct table
+            TestGetSourceColumnsWithFunctions("FnQ() | union TabXZ", "x", "TabXZ.x", "", globals);
+
+            // Pass-through function with downstream rename: function attribution still detected
+            TestGetSourceColumnsWithFunctions("FnWithArg(10) | project NewX=x", "NewX", "TabXY.x", "FnWithArg", globals);
+        }
+
+        [TestMethod]
+        public void TestGetSourceColumnMapWithFunctions()
+        {
+            var globals = GlobalState.Default
+                .WithCluster(
+                    new ClusterSymbol("cluster",
+                        new DatabaseSymbol("db1",
+                            new TableSymbol("TabXY", "(x: long, y: string)"),
+                            new FunctionSymbol("FnQ", "()", "{ TabXY | project Q=x }"))))
+                .WithDatabase("db1");
+
+            // Verify map returns correct function attribution per-column
+            var code = KustoCode.ParseAndAnalyze("FnQ", globals);
+            var dx = code.GetDiagnostics();
+            Assert.AreEqual(0, dx.Count, $"Unexpected diagnostic: {(dx.Count > 0 ? dx[0].Message : "")}");
+
+            var map = code.GetSourceColumnMapWithFunctions();
+            Assert.AreEqual(1, map.Count, "Expected 1 result column");
+
+            foreach (var kvp in map)
+            {
+                Assert.AreEqual("Q", kvp.Key.Name);
+                Assert.AreEqual(1, kvp.Value.Count);
+                Assert.AreEqual("x", kvp.Value[0].Column.Name);
+                Assert.AreEqual(1, kvp.Value[0].FunctionCallChain.Count);
+                Assert.AreEqual("FnQ", kvp.Value[0].FunctionCallChain[0].Name);
+            }
+        }
+
+        [TestMethod]
+        public void TestGetSourceColumns_MaterializedView()
+        {
+            var globals = GlobalState.Default
+                .WithCluster(
+                    new ClusterSymbol("cluster",
+                        new DatabaseSymbol("db1",
+                            new MaterializedViewSymbol("MV_Indicators", "(x: long, y: string)", "TabXY | summarize count() by x, y"),
+                            new FunctionSymbol("FnMV", "()", "{ MV_Indicators | project Q=x }"),
+                            new FunctionSymbol("FnMVFilter", "(a: long)", "{ MV_Indicators | where x == a }"))))
+                .WithDatabase("db1");
+
+            // Direct materialized view access: columns should be resolved
+            TestGetSourceColumns("MV_Indicators", "x", "MV_Indicators.x", globals);
+            TestGetSourceColumns("MV_Indicators", "y", "MV_Indicators.y", globals);
+
+            // Materialized view with projection
+            TestGetSourceColumns("MV_Indicators | project x", "x", "MV_Indicators.x", globals);
+        }
+
+        [TestMethod]
+        public void TestGetSourceColumnsWithFunctions_MaterializedView()
+        {
+            var globals = GlobalState.Default
+                .WithCluster(
+                    new ClusterSymbol("cluster",
+                        new DatabaseSymbol("db1",
+                            new MaterializedViewSymbol("MV_Indicators", "(x: long, y: string)", "TabXY | summarize count() by x, y"),
+                            new FunctionSymbol("FnMV", "()", "{ MV_Indicators | project Q=x }"),
+                            new FunctionSymbol("FnMVFilter", "(a: long)", "{ MV_Indicators | where x == a }"))))
+                .WithDatabase("db1");
+
+            // Direct materialized view access: no function in chain
+            TestGetSourceColumnsWithFunctions("MV_Indicators", "x", "MV_Indicators.x", "", globals);
+            TestGetSourceColumnsWithFunctions("MV_Indicators", "y", "MV_Indicators.y", "", globals);
+
+            // Function that renames MV columns: function in chain
+            TestGetSourceColumnsWithFunctions("FnMV()", "Q", "MV_Indicators.x", "FnMV", globals);
+
+            // Pass-through function on MV (where): function attribution recovered
+            TestGetSourceColumnsWithFunctions("FnMVFilter(10)", "x", "MV_Indicators.x", "FnMVFilter", globals);
+            TestGetSourceColumnsWithFunctions("FnMVFilter(10)", "y", "MV_Indicators.y", "FnMVFilter", globals);
+        }
+
+        private static void TestGetSourceColumnsWithFunctions(
+            string query, string outputColumnName, string expectedSourceColumn,
+            string expectedFunctionChain, GlobalState globals)
+        {
+            var code = KustoCode.ParseAndAnalyze(query, globals);
+            var dx = code.GetDiagnostics();
+            if (dx.Count > 0)
+            {
+                Assert.Fail($"unexpected diagnostic: {dx[0].Message}");
+            }
+
+            if (!(code.ResultType is TableSymbol tab) || !tab.TryGetColumn(outputColumnName, out var column))
+            {
+                Assert.Fail($"Column '{outputColumnName}' not found in result");
+                return;
+            }
+
+            var sourceInfos = code.GetSourceColumnsWithFunctions(column);
+
+            // Find the entry matching the expected source column
+            var expectedParts = expectedSourceColumn.Split('.');
+            var expectedTableName = expectedParts[0];
+            var expectedColName = expectedParts[1];
+
+            SourceColumnInfo matchingInfo = null;
+            foreach (var info in sourceInfos)
+            {
+                var table = globals.GetTable(info.Column);
+                // GetTable excludes materialized views — scan them as fallback
+                if (table == null)
+                {
+                    foreach (var database in globals.Clusters.SelectMany(cl => cl.Databases))
+                    {
+                        foreach (var mv in database.MaterializedViews)
+                        {
+                            if (mv.Columns.Contains(info.Column))
+                            { table = mv; break; }
+                        }
+                        if (table != null) break;
+                        foreach (var et in database.ExternalTables)
+                        {
+                            if (et.Columns.Contains(info.Column))
+                            { table = et; break; }
+                        }
+                        if (table != null) break;
+                    }
+                }
+                if (table != null && table.Name == expectedTableName && info.Column.Name == expectedColName)
+                {
+                    // Also match by function chain
+                    var actualChain = string.Join(">", info.FunctionCallChain.Select(f => f.Name));
+                    if (actualChain == expectedFunctionChain)
+                    {
+                        matchingInfo = info;
+                        break;
+                    }
+                }
+            }
+
+            if (matchingInfo == null)
+            {
+                var actualDescriptions = sourceInfos.Select(info =>
+                {
+                    var table = globals.GetTable(info.Column);
+                    if (table == null)
+                    {
+                        foreach (var database in globals.Clusters.SelectMany(cl => cl.Databases))
+                        {
+                            foreach (var mv in database.MaterializedViews)
+                            {
+                                if (mv.Columns.Contains(info.Column))
+                                { table = mv; break; }
+                            }
+                            if (table != null) break;
+                            foreach (var et in database.ExternalTables)
+                            {
+                                if (et.Columns.Contains(info.Column))
+                                { table = et; break; }
+                            }
+                            if (table != null) break;
+                        }
+                    }
+                    var tableName = table?.Name ?? "?";
+                    var chain = string.Join(">", info.FunctionCallChain.Select(f => f.Name));
+                    return $"{tableName}.{info.Column.Name} via [{chain}]";
+                });
+                Assert.Fail(
+                    $"Expected source {expectedSourceColumn} via [{expectedFunctionChain}], " +
+                    $"but got: {string.Join(", ", actualDescriptions)}");
+            }
+        }
+
+        [TestMethod]
         public void TestGetSourceColumns_macro_expand()
         {
             var globals = GlobalState.Default
@@ -600,10 +806,23 @@ namespace Tests
             {
                 return $"{GetDottedName(table, globals)}.{column.Name}";
             }
-            else
+
+            // GetTable excludes materialized views — scan them as fallback
+            foreach (var database in globals.Clusters.SelectMany(c => c.Databases))
             {
-                return column.Name;
+                foreach (var mv in database.MaterializedViews)
+                {
+                    if (mv.Columns.Contains(column))
+                        return $"{GetDottedName(mv, globals)}.{column.Name}";
+                }
+                foreach (var et in database.ExternalTables)
+                {
+                    if (et.Columns.Contains(column))
+                        return $"{GetDottedName(et, globals)}.{column.Name}";
+                }
             }
+
+            return column.Name;
         }
 
         private static string GetDottedName(FunctionSymbol function, GlobalState globals)
@@ -663,7 +882,8 @@ namespace Tests
         private static TableSymbol GetTable(QualifiedName name, GlobalState globals)
         {
             var database = GetDatabase(name, globals);
-            return database?.GetTable(name.EntityName);
+            // GetTable excludes materialized views and external tables; use GetAnyTable
+            return database?.GetAnyTable(name.EntityName);
         }
 
         private static ColumnSymbol GetColumn(QualifiedName name, GlobalState globals)
